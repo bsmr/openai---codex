@@ -8,7 +8,9 @@ use std::sync::atomic::Ordering;
 
 use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_message_processor::CodexMessageProcessorArgs;
+use crate::config_api::AuthFailureReportingReconciler;
 use crate::config_api::ConfigApi;
+use crate::config_api::ConfigReloadHooks;
 use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::external_agent_config_api::ExternalAgentConfigApi;
@@ -186,6 +188,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) cloud_requirements: CloudRequirementsLoader,
     pub(crate) feedback: CodexFeedback,
     pub(crate) log_db: Option<LogDbLayer>,
+    pub(crate) auth_failure_reporting_reconciler: Option<AuthFailureReportingReconciler>,
     pub(crate) config_warnings: Vec<ConfigWarningNotification>,
     pub(crate) session_source: SessionSource,
     pub(crate) enable_codex_api_key_env: bool,
@@ -206,6 +209,7 @@ impl MessageProcessor {
             cloud_requirements,
             feedback,
             log_db,
+            auth_failure_reporting_reconciler,
             config_warnings,
             session_source,
             enable_codex_api_key_env,
@@ -267,7 +271,7 @@ impl MessageProcessor {
             runtime_feature_enablement,
             loader_overrides,
             cloud_requirements,
-            thread_manager,
+            ConfigReloadHooks::new(thread_manager, auth_failure_reporting_reconciler),
             analytics_events_client.clone(),
         );
         let external_agent_config_api = ExternalAgentConfigApi::new(config.codex_home.clone());

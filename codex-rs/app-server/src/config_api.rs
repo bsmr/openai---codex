@@ -55,6 +55,8 @@ pub(crate) trait UserConfigReloader: Send + Sync {
     async fn reload_user_config(&self);
 }
 
+pub(crate) type AuthFailureReportingReconciler = Arc<dyn Fn(bool) + Send + Sync>;
+
 #[async_trait]
 impl UserConfigReloader for ThreadManager {
     async fn reload_user_config(&self) {
@@ -71,13 +73,41 @@ impl UserConfigReloader for ThreadManager {
 }
 
 #[derive(Clone)]
+pub(crate) struct ConfigReloadHooks {
+    user_config_reloader: Arc<dyn UserConfigReloader>,
+    auth_failure_reporting_reconciler: Option<AuthFailureReportingReconciler>,
+}
+
+impl ConfigReloadHooks {
+    pub(crate) fn new(
+        user_config_reloader: Arc<dyn UserConfigReloader>,
+        auth_failure_reporting_reconciler: Option<AuthFailureReportingReconciler>,
+    ) -> Self {
+        Self {
+            user_config_reloader,
+            auth_failure_reporting_reconciler,
+        }
+    }
+
+    async fn reload_user_config(&self) {
+        self.user_config_reloader.reload_user_config().await;
+    }
+
+    fn reconcile_auth_failure_reporting(&self, enabled: bool) {
+        if let Some(reconcile) = self.auth_failure_reporting_reconciler.as_ref() {
+            reconcile(enabled);
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ConfigApi {
     codex_home: PathBuf,
     cli_overrides: Arc<RwLock<Vec<(String, TomlValue)>>>,
     runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
     loader_overrides: LoaderOverrides,
     cloud_requirements: Arc<RwLock<CloudRequirementsLoader>>,
-    user_config_reloader: Arc<dyn UserConfigReloader>,
+    reload_hooks: ConfigReloadHooks,
     analytics_events_client: AnalyticsEventsClient,
 }
 
@@ -88,7 +118,7 @@ impl ConfigApi {
         runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
         loader_overrides: LoaderOverrides,
         cloud_requirements: Arc<RwLock<CloudRequirementsLoader>>,
-        user_config_reloader: Arc<dyn UserConfigReloader>,
+        reload_hooks: ConfigReloadHooks,
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         Self {
@@ -97,7 +127,7 @@ impl ConfigApi {
             runtime_feature_enablement,
             loader_overrides,
             cloud_requirements,
-            user_config_reloader,
+            reload_hooks,
             analytics_events_client,
         }
     }
@@ -232,7 +262,10 @@ impl ConfigApi {
             .map_err(map_error)?;
         self.emit_plugin_toggle_events(pending_changes);
         if reload_user_config {
-            self.user_config_reloader.reload_user_config().await;
+            let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+            self.reload_hooks
+                .reconcile_auth_failure_reporting(config.feedback_enabled);
+            self.reload_hooks.reload_user_config().await;
         }
         Ok(response)
     }
@@ -294,7 +327,7 @@ impl ConfigApi {
         }
 
         self.load_latest_config(/*fallback_cwd*/ None).await?;
-        self.user_config_reloader.reload_user_config().await;
+        self.reload_hooks.reload_user_config().await;
 
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
     }
@@ -522,6 +555,7 @@ mod tests {
     use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
@@ -535,6 +569,19 @@ mod tests {
     impl UserConfigReloader for RecordingUserConfigReloader {
         async fn reload_user_config(&self) {
             self.call_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAuthFailureReportingReconciler {
+        call_count: AtomicUsize,
+        last_value: AtomicBool,
+    }
+
+    impl RecordingAuthFailureReportingReconciler {
+        fn reconcile(&self, enabled: bool) {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            self.last_value.store(enabled, Ordering::Relaxed);
         }
     }
 
@@ -805,7 +852,7 @@ mod tests {
             Arc::new(RwLock::new(BTreeMap::new())),
             LoaderOverrides::default(),
             Arc::new(RwLock::new(CloudRequirementsLoader::default())),
-            reloader.clone(),
+            ConfigReloadHooks::new(reloader.clone(), None),
             AnalyticsEventsClient::new(
                 auth_manager,
                 analytics_config
@@ -847,5 +894,60 @@ mod tests {
             "model = \"gpt-5\"\n"
         );
         assert_eq!(reloader.call_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_write_reconciles_auth_failure_reporting_when_reloading_user_config() {
+        let codex_home = TempDir::new().expect("create temp dir");
+        let user_config_path = codex_home.path().join("config.toml");
+        std::fs::write(&user_config_path, "").expect("write config");
+        let reloader = Arc::new(RecordingUserConfigReloader::default());
+        let reporting = Arc::new(RecordingAuthFailureReportingReconciler::default());
+        let analytics_config = Arc::new(
+            codex_core::config::ConfigBuilder::default()
+                .build()
+                .await
+                .expect("load analytics config"),
+        );
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
+        let config_api = ConfigApi::new(
+            codex_home.path().to_path_buf(),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            LoaderOverrides::default(),
+            Arc::new(RwLock::new(CloudRequirementsLoader::default())),
+            ConfigReloadHooks::new(
+                reloader,
+                Some({
+                    let reporting = reporting.clone();
+                    Arc::new(move |enabled| reporting.reconcile(enabled))
+                }),
+            ),
+            AnalyticsEventsClient::new(
+                auth_manager,
+                analytics_config
+                    .chatgpt_base_url
+                    .trim_end_matches('/')
+                    .to_string(),
+                analytics_config.analytics_enabled,
+            ),
+        );
+
+        config_api
+            .batch_write(ConfigBatchWriteParams {
+                edits: vec![codex_app_server_protocol::ConfigEdit {
+                    key_path: "feedback.enabled".to_string(),
+                    value: json!(false),
+                    merge_strategy: codex_app_server_protocol::MergeStrategy::Replace,
+                }],
+                file_path: Some(user_config_path.display().to_string()),
+                expected_version: None,
+                reload_user_config: true,
+            })
+            .await
+            .expect("batch write should succeed");
+
+        assert_eq!(reporting.call_count.load(Ordering::Relaxed), 1);
+        assert!(!reporting.last_value.load(Ordering::Relaxed));
     }
 }

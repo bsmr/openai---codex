@@ -244,6 +244,7 @@ fn build_test_processor(
         cloud_requirements: CloudRequirementsLoader::default(),
         feedback: CodexFeedback::new(),
         log_db: None,
+        auth_failure_reporting_reconciler: None,
         config_warnings: Vec::new(),
         session_source: SessionSource::VSCode,
         enable_codex_api_key_env: false,
