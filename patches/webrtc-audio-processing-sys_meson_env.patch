@@ -324,33 +324,33 @@ index 8578e92..7837fbf 100644
 +    }
 +
 +    for tool_env in ["CC", "CXX"] {
-+        let Some(tool_path) = env::var_os(tool_env).map(PathBuf::from) else {
++        let Some(tool_value) = env::var_os(tool_env) else {
 +            continue;
 +        };
-+        let mut tool_path = tool_path;
-+        if !tool_path.is_absolute() {
-+            let mut resolved = None;
-+            if let Ok(current_dir) = env::current_dir() {
-+                let candidate = current_dir.join(&tool_path);
-+                if candidate.exists() {
-+                    resolved = Some(candidate);
-+                }
-+            }
-+            if resolved.is_none() {
-+                if let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) {
-+                    for ancestor in manifest_dir.ancestors() {
-+                        let candidate = ancestor.join(&tool_path);
-+                        if candidate.exists() {
-+                            resolved = Some(candidate);
-+                            break;
-+                        }
++        let tool_path = PathBuf::from(tool_value);
++        let tool_path = if tool_path.is_absolute() {
++            tool_path
++        } else if let Ok(current_dir) = env::current_dir() {
++            let current_dir_candidate = current_dir.join(&tool_path);
++            if current_dir_candidate.exists() {
++                current_dir_candidate
++            } else if let Some(manifest_dir) = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) {
++                let mut resolved = tool_path.clone();
++                for ancestor in manifest_dir.ancestors() {
++                    let ancestor_candidate = ancestor.join(&tool_path);
++                    if ancestor_candidate.exists() {
++                        resolved = ancestor_candidate;
++                        break;
 +                    }
 +                }
++                resolved
++            } else {
++                tool_path
 +            }
-+            if let Some(resolved_path) = resolved {
-+                tool_path = resolved_path;
-+            }
-+        }
++        } else {
++            tool_path
++        };
++
 +        let Some(tool_dir) = tool_path.parent() else {
 +            continue;
 +        };
@@ -369,8 +369,9 @@ index 8578e92..7837fbf 100644
 +        }
 +
 +        while let Some(directory) = directories.pop() {
-+            let Ok(read_dir) = fs::read_dir(&directory) else {
-+                continue;
++            let read_dir = match fs::read_dir(&directory) {
++                Ok(read_dir) => read_dir,
++                Err(_) => continue,
 +            };
 +
 +            for entry in read_dir.filter_map(std::result::Result::ok) {
@@ -383,14 +384,16 @@ index 8578e92..7837fbf 100644
 +                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
 +                    continue;
 +                };
-+                if matches!(file_name, "libclang.so" | "libclang.dll" | "libclang.dylib")
++                let is_libclang = matches!(file_name, "libclang.so" | "libclang.dll" | "libclang.dylib")
 +                    || file_name.starts_with("libclang.so.")
-+                    || file_name.starts_with("libclang-")
-+                {
-+                    if let Some(parent) = path.parent() {
-+                        env::set_var("LIBCLANG_PATH", parent);
-+                        return;
-+                    }
++                    || file_name.starts_with("libclang-");
++                if !is_libclang {
++                    continue;
++                }
++
++                if let Some(parent) = path.parent() {
++                    env::set_var("LIBCLANG_PATH", parent);
++                    return;
 +                }
 +            }
 +        }
